@@ -1,0 +1,3 @@
+# This directory was originally for DeepEval but is no longer needed
+# Keeping for compatibility - can be safely removed
+# Our custom evaluator doesn't require this directory
