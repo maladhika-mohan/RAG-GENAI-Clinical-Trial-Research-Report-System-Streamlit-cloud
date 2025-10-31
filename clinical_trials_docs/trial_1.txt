@@ -1,0 +1,39 @@
+Clinical Trial: Aspirin for Cardiovascular Disease Prevention
+Study ID: NCT12345678
+Phase: III
+Status: Completed
+
+BACKGROUND:
+Aspirin has been widely studied for its cardioprotective effects. This randomized controlled trial evaluated the efficacy and safety of low-dose aspirin (81mg daily) for primary prevention of cardiovascular events in adults aged 50-70 years.
+
+METHODS:
+This double-blind, placebo-controlled trial enrolled 15,000 participants across 50 centers. Participants were randomized 1:1 to receive either aspirin 81mg daily or matching placebo. Primary endpoint was composite of cardiovascular death, non-fatal myocardial infarction, and non-fatal stroke.
+
+PARTICIPANTS:
+- Age: 50-70 years
+- No history of cardiovascular disease
+- At least one cardiovascular risk factor
+- Exclusion: bleeding disorders, anticoagulant use
+
+RESULTS:
+After median follow-up of 5.2 years:
+- Primary endpoint occurred in 4.2% of aspirin group vs 5.1% of placebo group (HR 0.82, 95% CI 0.71-0.95, p=0.008)
+- Major bleeding events: 2.1% aspirin vs 1.2% placebo (HR 1.75, 95% CI 1.42-2.16, p<0.001)
+- Gastrointestinal bleeding: 1.5% aspirin vs 0.8% placebo
+- Intracranial hemorrhage: 0.3% aspirin vs 0.2% placebo
+
+ADVERSE EVENTS:
+Most common adverse events in aspirin group:
+- Dyspepsia: 12.3%
+- Gastrointestinal discomfort: 8.7%
+- Easy bruising: 6.2%
+- Epistaxis: 4.1%
+
+CONCLUSIONS:
+Low-dose aspirin significantly reduced cardiovascular events but increased bleeding risk. The net clinical benefit favors aspirin use in individuals with elevated cardiovascular risk and low bleeding risk.
+
+SAFETY PROFILE:
+Aspirin was generally well tolerated. Serious adverse events were rare but included major bleeding complications. Regular monitoring recommended for patients on long-term aspirin therapy.
+
+CLINICAL IMPLICATIONS:
+Results support current guidelines recommending aspirin for primary prevention in selected patients aged 50-70 with elevated cardiovascular risk and low bleeding risk.

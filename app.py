@@ -7,13 +7,20 @@ import streamlit as st
 import os
 import uuid
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import google.generativeai as genai
 from document_processor import DocumentProcessor
 from embedding_generator import get_embedding_generator
 from vector_database import get_vector_database
 # Import custom evaluator (our own implementation)
 from custom_evaluator import get_custom_evaluator
+
+# Import new features
+from prompt_optimizer import get_prompt_optimizer, PromptOptimizer
+from memory_integration import get_memory_manager, RAGMemoryManager
+from token_counter import get_token_counter, format_token_count, estimate_cost
+from mcp_client import get_mcp_client, process_query_with_agentic_rag, run_async_in_streamlit, check_mcp_server_health
+from feedback_system import get_feedback_system
 
 # Load environment variables if available
 try:
@@ -493,13 +500,41 @@ def initialize_session_state():
     if 'evaluator_type' not in st.session_state:
         st.session_state.evaluator_type = "custom"
 
+    # New feature states
+    if 'enable_agentic_rag' not in st.session_state:
+        st.session_state.enable_agentic_rag = False
+    if 'enable_prompt_optimization' not in st.session_state:
+        st.session_state.enable_prompt_optimization = False
+    if 'enable_memory' not in st.session_state:
+        st.session_state.enable_memory = False
+    if 'mcp_server_running' not in st.session_state:
+        st.session_state.mcp_server_running = False
+    if 'mcp_client' not in st.session_state:
+        st.session_state.mcp_client = None
+    if 'prompt_optimizer' not in st.session_state:
+        st.session_state.prompt_optimizer = None
+    if 'memory_manager' not in st.session_state:
+        st.session_state.memory_manager = None
+    if 'current_session_id' not in st.session_state:
+        st.session_state.current_session_id = str(uuid.uuid4())
+    if 'current_context_id' not in st.session_state:
+        st.session_state.current_context_id = None
+    if 'token_usage_stats' not in st.session_state:
+        st.session_state.token_usage_stats = []
+    if 'feedback_system' not in st.session_state:
+        st.session_state.feedback_system = None
+    if 'feedback_enabled' not in st.session_state:
+        st.session_state.feedback_enabled = False
+    if 'pending_feedback' not in st.session_state:
+        st.session_state.pending_feedback = {}
+
 def setup_gemini_api():
     """Setup Gemini API configuration"""
     st.sidebar.header("🔑 Gemini API Configuration")
-    
+
     # Try to get API key from environment first
     env_api_key = os.getenv('GEMINI_API_KEY')
-    
+
     api_key = st.sidebar.text_input(
         "Gemini API Key",
         type="password",
@@ -507,19 +542,23 @@ def setup_gemini_api():
         placeholder="AIza...",
         value=env_api_key if env_api_key and env_api_key != 'your_gemini_api_key_here' else ""
     )
-    
+
     if api_key:
         try:
             genai.configure(api_key=api_key)
             st.session_state.gemini_client = genai.GenerativeModel('gemini-2.0-flash-lite')
-            
+            st.session_state.api_key = api_key  # Store for feedback system
+
             # Setup evaluator if evaluation is enabled
             if st.session_state.enable_evaluation:
                 if st.session_state.evaluator is None:
                     # Use our custom evaluator
                     st.session_state.evaluator = get_custom_evaluator(api_key)
                     st.session_state.evaluator_type = "custom"
-            
+
+            # Setup new features if enabled
+            setup_new_features(api_key)
+
             st.sidebar.success("✅ Gemini API configured")
             return True, api_key
         except Exception as e:
@@ -529,6 +568,110 @@ def setup_gemini_api():
         st.sidebar.info("Please enter your Gemini API key")
         st.sidebar.info("💡 Get your key from: [Google AI Studio](https://makersuite.google.com/app/apikey)")
         return False, None
+
+
+def setup_new_features(api_key: str):
+    """Setup new features (Agentic RAG, Prompt Optimization, Memory)"""
+    try:
+        # Setup Agentic RAG with MCP Server
+        if st.session_state.enable_agentic_rag and st.session_state.mcp_client is None:
+            st.session_state.mcp_client = get_mcp_client()
+            # Check server health
+            health_status = check_mcp_server_health()
+            st.session_state.mcp_server_running = health_status['status'] == 'running'
+
+            # Configure Gemini API if server is running and API key is available
+            if st.session_state.mcp_server_running and api_key:
+                try:
+                    # Connect to server and configure API
+                    with st.spinner("Connecting to MCP server..."):
+                        connection_success = run_async_in_streamlit(st.session_state.mcp_client.connect())
+
+                    if connection_success:
+                        with st.spinner("Configuring Gemini API..."):
+                            config_success = run_async_in_streamlit(
+                                st.session_state.mcp_client.configure_gemini_api(api_key)
+                            )
+                        if config_success:
+                            st.success("✅ Gemini API configured on MCP server")
+                        else:
+                            st.warning("⚠️ Failed to configure Gemini API on MCP server")
+                    else:
+                        st.warning("⚠️ Could not connect to MCP server. Make sure it's running on port 8050.")
+                except Exception as e:
+                    st.warning(f"MCP server configuration error: {str(e)}")
+
+        # Setup Prompt Optimizer
+        if st.session_state.enable_prompt_optimization and st.session_state.prompt_optimizer is None:
+            st.session_state.prompt_optimizer = get_prompt_optimizer("gemini-2.0-flash-lite", 4000)
+
+        # Setup Memory Manager
+        if st.session_state.enable_memory and st.session_state.memory_manager is None:
+            try:
+                st.session_state.memory_manager = get_memory_manager(api_key, "gemini-2.0-flash-lite")
+                st.session_state.memory_manager.set_current_session(st.session_state.current_session_id)
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ Memory integration partially available: {str(e)}")
+                # Still create the manager for basic functionality
+                try:
+                    st.session_state.memory_manager = get_memory_manager(api_key, "gemini-2.0-flash-lite")
+                    st.session_state.memory_manager.set_current_session(st.session_state.current_session_id)
+                except Exception as e2:
+                    st.sidebar.error(f"❌ Could not initialize memory: {str(e2)}")
+                    st.session_state.memory_manager = None
+
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ Error setting up new features: {str(e)}")
+
+
+def setup_advanced_features():
+    """Setup advanced features configuration in sidebar"""
+    st.sidebar.markdown("---")
+    st.sidebar.header("🚀 Advanced Features")
+
+    # Agentic RAG with MCP Server
+    enable_agentic_rag = st.sidebar.checkbox(
+        "Enable Agentic RAG with MCP Server",
+        value=st.session_state.enable_agentic_rag,
+        help="AI agent with intelligent tool calling for enhanced RAG operations"
+    )
+    st.session_state.enable_agentic_rag = enable_agentic_rag
+
+    if enable_agentic_rag:
+        st.sidebar.caption("🤖 Entity extraction, query refinement, and relevance checking")
+        st.sidebar.caption("⏱️ Note: Adds 5-10 seconds per query (multiple AI calls)")
+
+    # Prompt Optimization
+    enable_prompt_opt = st.sidebar.checkbox(
+        "Enable Token-Efficient Prompts",
+        value=st.session_state.enable_prompt_optimization,
+        help="Optimize prompts to reduce token usage"
+    )
+    st.session_state.enable_prompt_optimization = enable_prompt_opt
+
+    if enable_prompt_opt:
+        st.sidebar.caption("⚡ Dynamic context compression and optimization")
+
+    # Memory Integration
+    enable_memory = st.sidebar.checkbox(
+        "Enable LangChain Memory",
+        value=st.session_state.enable_memory,
+        help="Conversation memory and document-specific history"
+    )
+    st.session_state.enable_memory = enable_memory
+
+    if enable_memory:
+        st.sidebar.caption("🧠 Conversation buffer and summary memory")
+
+    # Feature status
+    if any([enable_agentic_rag, enable_prompt_opt, enable_memory]):
+        st.sidebar.markdown("**Active Features:**")
+        if enable_agentic_rag:
+            st.sidebar.write("• Agentic RAG with MCP Server")
+        if enable_prompt_opt:
+            st.sidebar.write("• Token Optimization")
+        if enable_memory:
+            st.sidebar.write("• Conversation Memory")
 
 def setup_evaluation_settings(api_key_available: bool):
     """Setup evaluation configuration"""
@@ -661,34 +804,210 @@ def process_documents(uploaded_files):
     except Exception as e:
         st.sidebar.error(f"Error processing documents: {str(e)}")
 
-def generate_response(query: str, relevant_chunks: List[Dict]) -> str:
-    """Generate response using Gemini API with relevant chunks"""
+def generate_response(query: str, relevant_chunks: List[Dict]) -> Tuple[str, Dict]:
+    """Generate response using Gemini API with relevant chunks and new features"""
     if not st.session_state.gemini_client:
-        return "Please configure Gemini API key first."
-    
+        return "Please configure Gemini API key first.", {}
+
+    # Initialize response metadata
+    response_metadata = {
+        'original_tokens': 0,
+        'optimized_tokens': 0,
+        'tokens_saved': 0,
+        'memory_used': False,
+        'agentic_tools_used': [],
+        'optimization_applied': False
+    }
+
     # Prepare context from chunks
     context = "\n\n".join([
         f"Source: {chunk['filename']}\nContent: {chunk['text']}"
         for chunk in relevant_chunks
     ])
-    
-    # Create prompt
-    prompt = f"""
-Based on the following document context, answer the user's question.
 
-Document Context:
-{context}
+    # Add memory context if enabled
+    memory_context = ""
+    memory_history = None
+    if st.session_state.enable_memory and st.session_state.memory_manager:
+        try:
+            document_ids = list(set(chunk.get('document_id', 'unknown') for chunk in relevant_chunks))
+            memory_history = st.session_state.memory_manager.get_relevant_history(
+                query, document_ids, max_interactions=5
+            )
 
-User Question: {query}
+            # If this is a history query, prioritize memory over documents
+            if memory_history.get('is_history_query', False):
+                memory_context = memory_history.get('formatted_history', '')
+                response_metadata['memory_query_type'] = 'history_query'
+                response_metadata['memory_used'] = True
 
-Please provide a helpful answer based on the documents. If you reference specific information, mention which document it came from.
-"""
-    
+                # For history queries, we might want to use less document context
+                if memory_context:
+                    context = context[:500] + "..." if len(context) > 500 else context
+            else:
+                if memory_history['buffer_history'] or memory_history['summary']:
+                    memory_context = st.session_state.memory_manager.get_conversation_context(500)
+                    response_metadata['memory_query_type'] = 'context_query'
+                    response_metadata['memory_used'] = True
+        except Exception as e:
+            st.warning(f"Memory integration error: {str(e)}")
+
+    # Create prompt with or without optimization
+    if st.session_state.enable_prompt_optimization and st.session_state.prompt_optimizer:
+        try:
+            # Use optimized prompt construction
+            variables = {
+                'context': context,
+                'query': query
+            }
+
+            # Add memory context if available and handle history queries
+            if memory_context:
+                if memory_history and memory_history.get('is_history_query', False):
+                    # For history queries, prioritize memory context
+                    variables['context'] = f"{memory_context}\n\nAdditional Document Context:\n{context[:500]}..."
+                else:
+                    variables['context'] = f"{memory_context}\n\nDocument Context:\n{context}"
+
+            prompt_result = st.session_state.prompt_optimizer.build_optimized_prompt(
+                'rag_query_detailed', variables, target_tokens=3500
+            )
+
+            prompt = prompt_result['prompt']
+            response_metadata.update({
+                'original_tokens': prompt_result['initial_tokens'],
+                'optimized_tokens': prompt_result['final_tokens'],
+                'tokens_saved': prompt_result['tokens_saved'],
+                'optimization_applied': prompt_result['optimization_applied']
+            })
+
+        except Exception as e:
+            st.warning(f"Prompt optimization error: {str(e)}")
+            # Fallback to standard prompt
+            is_history_query = memory_history.get('is_history_query', False) if memory_history else False
+            prompt = create_standard_prompt(query, context, memory_context, is_history_query)
+    else:
+        # Standard prompt creation
+        is_history_query = memory_history.get('is_history_query', False) if memory_history else False
+        prompt = create_standard_prompt(query, context, memory_context, is_history_query)
+
+        # Count tokens for metadata
+        if st.session_state.enable_prompt_optimization:
+            token_counter = get_token_counter()
+            response_metadata['original_tokens'] = token_counter.count_tokens(prompt)
+            response_metadata['optimized_tokens'] = response_metadata['original_tokens']
+
+    # Agentic RAG processing with MCP tools
+    if st.session_state.enable_agentic_rag and st.session_state.mcp_client:
+        try:
+            # Connect to MCP server if not connected
+            if not st.session_state.mcp_client.connected:
+                connection_success = run_async_in_streamlit(st.session_state.mcp_client.connect())
+                if connection_success:
+                    st.session_state.mcp_server_running = True
+
+            # Process query with agentic tools if connected
+            if st.session_state.mcp_client.connected:
+                # Get document chunks for processing (reduced to 3 for speed)
+                doc_chunks = [chunk.get('text', chunk.get('content', '')) for chunk in relevant_chunks[:3]]
+
+                # Process with agentic RAG - this takes 5-10 seconds due to multiple AI calls
+                # Note: Each tool (entity extraction, query enhancement, relevance check) calls Gemini API
+                refined_query, tools_used, agentic_metadata = run_async_in_streamlit(
+                    process_query_with_agentic_rag(st.session_state.mcp_client, query, doc_chunks)
+                )
+
+                # Update query if refined
+                if refined_query != query and tools_used:
+                    query = refined_query
+                    response_metadata['query_refined'] = True
+                    response_metadata['original_query'] = agentic_metadata.get('original_query', query)
+
+                response_metadata['agentic_tools_used'] = tools_used
+                response_metadata['agentic_metadata'] = agentic_metadata
+
+            else:
+                response_metadata['agentic_tools_used'] = []
+
+        except Exception as e:
+            st.warning(f"Agentic RAG processing error: {str(e)}")
+            response_metadata['agentic_tools_used'] = []
+    else:
+        response_metadata['agentic_tools_used'] = []
+
     try:
+        # Generate response
         response = st.session_state.gemini_client.generate_content(prompt)
-        return response.text
+        response_text = response.text
+
+        # Placeholder for Agentic RAG response processing
+        if st.session_state.enable_agentic_rag:
+            # Will be implemented with tool usage tracking
+            pass
+
+        # Add to memory if enabled
+        if st.session_state.enable_memory and st.session_state.memory_manager:
+            try:
+                document_ids = list(set(chunk.get('document_id', 'unknown') for chunk in relevant_chunks))
+                st.session_state.memory_manager.add_conversation(
+                    query, response_text, document_ids,
+                    {'chunks_used': len(relevant_chunks), 'optimization_applied': response_metadata['optimization_applied']}
+                )
+            except Exception as e:
+                st.warning(f"Memory storage error: {str(e)}")
+
+        return response_text, response_metadata
+
     except Exception as e:
-        return f"Error generating response: {str(e)}"
+        error_msg = f"Error generating response: {str(e)}"
+
+        # Placeholder for error logging in Agentic RAG
+        if st.session_state.enable_agentic_rag:
+            # Will be implemented with proper error handling
+            pass
+
+        return error_msg, response_metadata
+
+
+def create_standard_prompt(query: str, context: str, memory_context: str = "", is_history_query: bool = False) -> str:
+    """Create standard prompt without optimization"""
+    prompt_parts = []
+
+    if is_history_query and memory_context:
+        # For history queries, prioritize conversation history
+        prompt_parts.extend([
+            "Conversation History:",
+            memory_context,
+            "",
+            f"User Question: {query}",
+            "",
+            "Please answer the question based on our conversation history above. If the question is about previous questions, discussions, or what was mentioned before, refer to the conversation history."
+        ])
+
+        # Add document context as supplementary if available
+        if context:
+            prompt_parts.extend([
+                "",
+                "Additional Document Context (if relevant):",
+                context[:500] + "..." if len(context) > 500 else context
+            ])
+    else:
+        # Standard document-based query
+        if memory_context:
+            prompt_parts.append(f"Previous conversation context:\n{memory_context}\n")
+
+        prompt_parts.extend([
+            "Based on the following document context, answer the user's question.",
+            "",
+            "Document Context:",
+            context,
+            "",
+            f"User Question: {query}",
+            "",
+            "Please provide a helpful answer based on the documents. If you reference specific information, mention which document it came from."
+        ])
+
+    return "\n".join(prompt_parts)
 
 def test_api_connection():
     """Test if the Gemini API is responding"""
@@ -951,8 +1270,64 @@ def display_evaluation_logs_page():
     
     # Summary Statistics
     st.markdown("### 📈 Summary Statistics")
-    
+
     total_evaluations = len(st.session_state.evaluation_logs)
+
+    # Token usage statistics
+    token_stats = st.session_state.get('token_usage_stats', [])
+    if token_stats:
+        st.markdown("### ⚡ Token Optimization Statistics")
+
+        total_original = sum(stat['original_tokens'] for stat in token_stats)
+        total_optimized = sum(stat['optimized_tokens'] for stat in token_stats)
+        total_saved = sum(stat['tokens_saved'] for stat in token_stats)
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Total Original Tokens</h3>
+                <div style="font-size: 2rem; font-weight: 700; color: #6366f1;">
+                    {format_token_count(total_original)}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Total Optimized Tokens</h3>
+                <div style="font-size: 2rem; font-weight: 700; color: #10b981;">
+                    {format_token_count(total_optimized)}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Total Tokens Saved</h3>
+                <div style="font-size: 2rem; font-weight: 700; color: #f59e0b;">
+                    {format_token_count(total_saved)}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col4:
+            efficiency = (total_saved / total_original * 100) if total_original > 0 else 0
+            cost_saved = estimate_cost(total_saved, "gemini-2.0-flash-lite")
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Efficiency</h3>
+                <div style="font-size: 2rem; font-weight: 700; color: #8b5cf6;">
+                    {efficiency:.1f}%
+                </div>
+                <div style="font-size: 0.9rem; color: #64748b;">
+                    ~${cost_saved:.4f} saved
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
     
     # Calculate average scores across all evaluations
     all_scores = []
@@ -1160,45 +1535,288 @@ def display_settings_page():
     
     # System Configuration
     st.markdown("### 🔧 System Configuration")
-    
+
     # Current settings display
     col1, col2 = st.columns(2)
-    
+
     with col1:
         st.markdown("""
         <div class="metric-card">
             <h3>🔍 RAG Settings</h3>
         </div>
         """, unsafe_allow_html=True)
-        
+
         current_top_k = st.session_state.get('top_k', 5)
         st.write(f"**Top-K Retrieval**: {current_top_k}")
-        
+
         evaluation_enabled = st.session_state.get('enable_evaluation', False)
         st.write(f"**Evaluation Enabled**: {'✅ Yes' if evaluation_enabled else '❌ No'}")
-        
+
         if evaluation_enabled:
             metrics = st.session_state.get('selected_metrics', [])
             st.write(f"**Active Metrics**: {', '.join(metrics) if metrics else 'None'}")
-            
+
             threshold = st.session_state.get('eval_threshold', 0.7)
             st.write(f"**Score Threshold**: {threshold}")
-    
+
     with col2:
         st.markdown("""
         <div class="metric-card">
             <h3>📊 Evaluation Status</h3>
         </div>
         """, unsafe_allow_html=True)
-        
+
         total_logs = len(st.session_state.get('evaluation_logs', []))
         st.write(f"**Total Evaluations**: {total_logs}")
-        
+
         api_configured = st.session_state.gemini_client is not None
         st.write(f"**API Status**: {'✅ Configured' if api_configured else '❌ Not Configured'}")
-        
+
         evaluator_ready = st.session_state.evaluator is not None
         st.write(f"**Evaluator Status**: {'✅ Ready' if evaluator_ready else '❌ Not Ready'}")
+
+    # Feedback System Configuration
+    st.markdown("### 📝 Feedback System Configuration")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        <div class="metric-card">
+            <h3>📊 Feedback Collection</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        feedback_enabled = st.checkbox(
+            "Enable Feedback Collection",
+            value=st.session_state.get('feedback_enabled', False),
+            help="Allow users to provide feedback on responses"
+        )
+        st.session_state.feedback_enabled = feedback_enabled
+        
+        if feedback_enabled:
+            if st.session_state.gemini_client and not st.session_state.feedback_system:
+                # Initialize feedback system
+                api_key = st.session_state.get('api_key')
+                if api_key:
+                    smtp_config = st.session_state.get('smtp_config')
+                    st.session_state.feedback_system = get_feedback_system(api_key, smtp_config)
+                    st.success("✅ Feedback system initialized")
+            
+            if st.session_state.feedback_system:
+                stats = st.session_state.feedback_system.get_feedback_statistics()
+                st.write(f"**Total Feedback**: {stats.get('total_feedback', 0)}")
+                
+                if stats.get('sentiment_distribution'):
+                    st.write("**Sentiment Distribution**:")
+                    for sentiment, count in stats['sentiment_distribution'].items():
+                        st.write(f"  • {sentiment.title()}: {count}")
+                
+                if stats.get('average_rating'):
+                    st.write(f"**Average Rating**: {stats['average_rating']:.2f}/5")
+    
+    with col2:
+        st.markdown("""
+        <div class="metric-card">
+            <h3>📧 Email Notifications</h3>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if feedback_enabled:
+            st.write("Configure email notifications for feedback:")
+            
+            recipient_email = st.text_input(
+                "Recipient Email",
+                value=st.session_state.get('feedback_recipient_email', ''),
+                placeholder="manager@company.com",
+                help="Email address to receive feedback notifications"
+            )
+            st.session_state.feedback_recipient_email = recipient_email
+            
+            recipient_name = st.text_input(
+                "Recipient Name",
+                value=st.session_state.get('feedback_recipient_name', 'Team'),
+                placeholder="Product Manager",
+                help="Name or role of the recipient"
+            )
+            st.session_state.feedback_recipient_name = recipient_name
+            
+            with st.expander("📧 SMTP Configuration (Optional)"):
+                st.markdown("""
+                **For Gmail users:**
+                1. Enable 2-Factor Authentication on your Google Account
+                2. Generate an App Password at: https://myaccount.google.com/apppasswords
+                3. Use the 16-character App Password below (not your regular password)
+                
+                See `GMAIL_APP_PASSWORD_SETUP.md` for detailed instructions.
+                """)
+                
+                smtp_server = st.text_input("SMTP Server", value="smtp.gmail.com")
+                smtp_port = st.number_input("SMTP Port", value=587, min_value=1, max_value=65535)
+                smtp_username = st.text_input("Username/Email", placeholder="your.email@gmail.com")
+                smtp_password = st.text_input(
+                    "Password (App Password for Gmail)", 
+                    type="password",
+                    placeholder="16-character App Password"
+                )
+                use_tls = st.checkbox("Use TLS", value=True)
+                from_email = st.text_input("From Email", value=smtp_username)
+                
+                if st.button("Save SMTP Configuration"):
+                    if smtp_server and smtp_username and smtp_password:
+                        st.session_state.smtp_config = {
+                            'smtp_server': smtp_server,
+                            'smtp_port': smtp_port,
+                            'username': smtp_username,
+                            'password': smtp_password,
+                            'use_tls': use_tls,
+                            'from_email': from_email or smtp_username
+                        }
+                        
+                        # Reinitialize feedback system with SMTP config
+                        if st.session_state.feedback_system:
+                            api_key = st.session_state.get('api_key')
+                            st.session_state.feedback_system = get_feedback_system(
+                                api_key, 
+                                st.session_state.smtp_config
+                            )
+                        
+                        st.success("✅ SMTP configuration saved! Test it by submitting feedback.")
+                    else:
+                        st.error("Please fill in all SMTP fields")
+        else:
+            st.info("Enable feedback collection to configure email notifications")
+    
+    if feedback_enabled and st.session_state.feedback_system:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📥 Export Feedback Data", use_container_width=True):
+                result = st.session_state.feedback_system.export_feedback()
+                if result['success']:
+                    st.success(f"✅ Exported {result['count']} feedback records to {result['filepath']}")
+                else:
+                    st.error(f"❌ Export failed: {result['error']}")
+        
+        with col2:
+            if st.button("🗑️ Clear Feedback History", use_container_width=True):
+                st.session_state.feedback_system.feedback_history = []
+                st.success("✅ Feedback history cleared!")
+    
+    st.markdown("---")
+    
+    # Advanced Features Configuration
+    st.markdown("### 🚀 Advanced Features Configuration")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("""
+        <div class="metric-card">
+            <h3>🤖 Agentic RAG with MCP Server</h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        agentic_enabled = st.session_state.get('enable_agentic_rag', False)
+        st.write(f"**Status**: {'✅ Enabled' if agentic_enabled else '❌ Disabled'}")
+
+        if agentic_enabled:
+            server_running = st.session_state.get('mcp_server_running', False)
+            st.write(f"**MCP Server**: {'🟢 Running' if server_running else '🔴 Stopped'}")
+            st.write(f"**Gemini API**: {'✅ Configured' if st.session_state.get('api_key') else '❌ Not Set'}")
+            st.write(f"**Available Tools**: Entity Extraction, Query Refinement, Relevance Check")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Check Server Status", use_container_width=True):
+                health_status = check_mcp_server_health()
+                if health_status['status'] == 'running':
+                    st.success(f"✅ Server running with {health_status['tools_available']} tools")
+                    st.session_state.mcp_server_running = True
+                elif health_status['status'] == 'stopped':
+                    st.error("❌ Server not running")
+                    st.session_state.mcp_server_running = False
+                else:
+                    st.warning("⚠️ MCP libraries not installed")
+
+        with col2:
+            if st.button("Configure API", use_container_width=True, disabled=not (agentic_enabled and st.session_state.get('api_key'))):
+                if st.session_state.get('mcp_client') and st.session_state.get('api_key'):
+                    try:
+                        # Check if server is running first
+                        if not st.session_state.mcp_client.is_server_running():
+                            st.error("❌ MCP server is not running. Please start it first with: python mcp_server.py")
+                        else:
+                            # Connect and configure API
+                            with st.spinner("Connecting to MCP server..."):
+                                connection_success = run_async_in_streamlit(st.session_state.mcp_client.connect())
+
+                            if connection_success:
+                                with st.spinner("Configuring Gemini API..."):
+                                    config_success = run_async_in_streamlit(
+                                        st.session_state.mcp_client.configure_gemini_api(st.session_state.api_key)
+                                    )
+                                if config_success:
+                                    st.success("✅ Gemini API configured on MCP server")
+                                else:
+                                    st.error("❌ Failed to configure Gemini API")
+                            else:
+                                st.error("❌ Could not connect to MCP server")
+                    except Exception as e:
+                        st.error(f"Configuration error: {str(e)}")
+                else:
+                    st.warning("⚠️ API key required")
+
+        st.info("🚀 To start the MCP server, run in terminal:")
+        st.code("python mcp_server.py", language="bash")
+
+    with col2:
+        st.markdown("""
+        <div class="metric-card">
+            <h3>⚡ Token Optimization</h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        opt_enabled = st.session_state.get('enable_prompt_optimization', False)
+        st.write(f"**Status**: {'✅ Enabled' if opt_enabled else '❌ Disabled'}")
+
+        if opt_enabled:
+            token_stats = st.session_state.get('token_usage_stats', [])
+            total_saved = sum(stat['tokens_saved'] for stat in token_stats)
+            st.write(f"**Total Tokens Saved**: {format_token_count(total_saved)}")
+
+            if token_stats:
+                avg_efficiency = sum(stat['tokens_saved'] / stat['original_tokens']
+                                   for stat in token_stats if stat['original_tokens'] > 0) / len(token_stats) * 100
+                st.write(f"**Avg Efficiency**: {avg_efficiency:.1f}%")
+
+        if st.button("Clear Token Stats", use_container_width=True):
+            st.session_state.token_usage_stats = []
+            st.success("✅ Token stats cleared!")
+
+    with col3:
+        st.markdown("""
+        <div class="metric-card">
+            <h3>🧠 Memory Integration</h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        memory_enabled = st.session_state.get('enable_memory', False)
+        st.write(f"**Status**: {'✅ Enabled' if memory_enabled else '❌ Disabled'}")
+
+        if memory_enabled and st.session_state.get('memory_manager'):
+            try:
+                memory_stats = st.session_state.memory_manager.get_memory_stats()
+                st.write(f"**Sessions**: {memory_stats.get('total_sessions', 0)}")
+                st.write(f"**Messages**: {memory_stats.get('current_session_messages', 0)}")
+                st.write(f"**Doc Memories**: {memory_stats.get('document_memories', 0)}")
+            except Exception as e:
+                st.write("**Status**: Error loading stats")
+
+        if st.button("Clear Memory", use_container_width=True):
+            if st.session_state.get('memory_manager'):
+                st.session_state.memory_manager.clear_session_memory()
+                st.success("✅ Memory cleared!")
     
     # Data Management
     st.markdown("### 🗂️ Data Management")
@@ -1359,7 +1977,7 @@ def display_chat_interface():
             """, unsafe_allow_html=True)
     
     # Chat history display
-    for i, chat in enumerate(st.session_state.chat_history):
+    for idx, chat in enumerate(st.session_state.chat_history):
         # User message
         with st.chat_message("user"):
             st.write(chat['query'])
@@ -1367,6 +1985,56 @@ def display_chat_interface():
         # Assistant message
         with st.chat_message("assistant"):
             st.write(chat['response'])
+            
+            # Show advanced features used (MCP tools, token optimization, memory)
+            if 'metadata' in chat:
+                response_metadata = chat['metadata']
+                if any([
+                    response_metadata.get('optimization_applied'),
+                    response_metadata.get('memory_used'),
+                    response_metadata.get('agentic_tools_used')
+                ]):
+                    with st.expander("🚀 Advanced Features Used"):
+                        # Token optimization
+                        if response_metadata.get('optimization_applied'):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Original Tokens", format_token_count(response_metadata.get('original_tokens', 0)))
+                            with col2:
+                                st.metric("Optimized Tokens", format_token_count(response_metadata.get('optimized_tokens', 0)))
+                            with col3:
+                                st.metric("Tokens Saved", format_token_count(response_metadata.get('tokens_saved', 0)))
+                            
+                            if response_metadata.get('tokens_saved', 0) > 0:
+                                efficiency = (response_metadata['tokens_saved'] / response_metadata['original_tokens']) * 100
+                                st.success(f"⚡ {efficiency:.1f}% token reduction achieved!")
+                        
+                        # Memory usage
+                        if response_metadata.get('memory_used'):
+                            st.info("🧠 Used conversation memory for enhanced context")
+                        
+                        # Agentic RAG tools
+                        if response_metadata.get('agentic_tools_used'):
+                            tools_used = response_metadata['agentic_tools_used']
+                            if tools_used:
+                                st.info(f"🤖 Agentic Tools Used: {', '.join(tools_used)}")
+                                
+                                # Show agentic metadata
+                                agentic_meta = response_metadata.get('agentic_metadata', {})
+                                if agentic_meta.get('entities'):
+                                    with st.expander("🔍 Extracted Entities"):
+                                        for entity_type, entities in agentic_meta['entities'].items():
+                                            if entities:
+                                                st.write(f"**{entity_type}**: {', '.join(entities)}")
+                                
+                                if agentic_meta.get('avg_relevance'):
+                                    relevance = agentic_meta['avg_relevance']
+                                    st.metric("Average Document Relevance", f"{relevance:.2f}")
+                                
+                                if response_metadata.get('query_refined'):
+                                    with st.expander("✨ Query Refinement"):
+                                        st.write(f"**Original**: {response_metadata.get('original_query', 'N/A')}")
+                                        st.write(f"**Refined**: {chat['query']}")
             
             # Show evaluation results if available
             if 'evaluation' in chat and chat['evaluation']:
@@ -1380,6 +2048,98 @@ def display_chat_interface():
                         st.write(f"**{j+1}. {source['filename']}** (Score: {source['score']:.3f})")
                         st.write(source['text'][:200] + "..." if len(source['text']) > 200 else source['text'])
                         st.divider()
+            
+            # Show feedback UI for each message in history
+            if st.session_state.feedback_enabled and st.session_state.feedback_system:
+                # Check if feedback already submitted for this message
+                feedback_key = f"feedback_submitted_{idx}"
+                if not st.session_state.get(feedback_key, False):
+                    with st.expander("📝 Provide Feedback on this Response", expanded=False):
+                        st.write("Help us improve! Share your thoughts on this response.")
+                        
+                        col1, col2 = st.columns([3, 1])
+                        
+                        with col1:
+                            feedback_text = st.text_area(
+                                "Your Feedback",
+                                placeholder="Was this response helpful? Any issues or suggestions?",
+                                key=f"history_feedback_text_{idx}",
+                                height=100
+                            )
+                        
+                        with col2:
+                            rating = st.select_slider(
+                                "Rating",
+                                options=[1, 2, 3, 4, 5],
+                                value=3,
+                                key=f"history_rating_{idx}"
+                            )
+                            st.caption("1=Poor, 5=Excellent")
+                        
+                        user_email = st.text_input(
+                            "Your Email",
+                            placeholder="your.email@example.com",
+                            key=f"history_user_email_{idx}"
+                        )
+                        
+                        if st.button("Submit Feedback", key=f"history_submit_feedback_{idx}"):
+                            if feedback_text.strip():
+                                with st.spinner("Analyzing feedback..."):
+                                    # Collect feedback
+                                    feedback_record = st.session_state.feedback_system.collect_feedback(
+                                        query=chat['query'],
+                                        response=chat['response'],
+                                        feedback_text=feedback_text,
+                                        rating=rating,
+                                        user_email=user_email if user_email else None,
+                                        metadata=chat.get('metadata', {})
+                                    )
+                                    
+                                    # Display sentiment analysis
+                                    if feedback_record['sentiment_analysis']['success']:
+                                        sentiment_data = feedback_record['sentiment_analysis']['sentiment_data']
+                                        
+                                        st.success("✅ Thank you for your feedback!")
+                                        
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("Sentiment", sentiment_data.get('sentiment', 'N/A').title())
+                                        with col2:
+                                            st.metric("Satisfaction", f"{sentiment_data.get('satisfaction_score', 'N/A')}/5")
+                                        with col3:
+                                            st.metric("Urgency", sentiment_data.get('urgency', 'N/A').title())
+                                        
+                                        # Send email
+                                        smtp_config = st.session_state.get('smtp_config')
+                                        recipient_email = st.session_state.get('feedback_recipient_email')
+                                        
+                                        if smtp_config and recipient_email:
+                                            try:
+                                                with st.spinner("Sending email..."):
+                                                    email_result = st.session_state.feedback_system.send_feedback_email(
+                                                        feedback_record,
+                                                        recipient_email,
+                                                        st.session_state.get('feedback_recipient_name', 'Team')
+                                                    )
+                                                
+                                                if email_result.get('success'):
+                                                    st.success(f"📧 Email sent to {recipient_email}")
+                                                else:
+                                                    st.error(f"❌ Email failed: {email_result.get('error')}")
+                                            except Exception as e:
+                                                st.error(f"❌ Email error: {str(e)}")
+                                        elif recipient_email and not smtp_config:
+                                            st.warning("⚠️ Configure SMTP in sidebar to send emails")
+                                        
+                                        # Mark as submitted
+                                        st.session_state[feedback_key] = True
+                                        st.rerun()
+                                    else:
+                                        st.warning("⚠️ Sentiment analysis failed")
+                            else:
+                                st.warning("Please enter feedback text")
+                else:
+                    st.info("✅ Feedback already submitted for this response")
     
     # Chat input
     if prompt := st.chat_input("Ask a question about your documents..."):
@@ -1389,52 +2149,197 @@ def display_chat_interface():
         
         # Generate response
         with st.chat_message("assistant"):
-            with st.spinner("Generating response..."):
-                # Search for relevant chunks if documents are available
-                relevant_chunks = []
-                if st.session_state.processed_documents:
+            # Search for relevant chunks if documents are available
+            relevant_chunks = []
+            if st.session_state.processed_documents:
+                with st.spinner("Searching documents..."):
                     relevant_chunks = search_documents(prompt)
+
+            # Generate response with new features
+            with st.spinner("Generating response..."):
+                response, response_metadata = generate_response(prompt, relevant_chunks)
+
+            # Display response with enhanced styling
+            st.markdown(f"""
+            <div class="response-container">
+                {response}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Display new feature information
+            if any([st.session_state.enable_prompt_optimization, st.session_state.enable_memory, st.session_state.enable_agentic_rag]):
+                with st.expander("🚀 Advanced Features Used"):
+                    if st.session_state.enable_prompt_optimization and response_metadata.get('optimization_applied'):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Original Tokens", format_token_count(response_metadata['original_tokens']))
+                            with col2:
+                                st.metric("Optimized Tokens", format_token_count(response_metadata['optimized_tokens']))
+                            with col3:
+                                st.metric("Tokens Saved", format_token_count(response_metadata['tokens_saved']))
+
+                            if response_metadata['tokens_saved'] > 0:
+                                efficiency = (response_metadata['tokens_saved'] / response_metadata['original_tokens']) * 100
+                                st.success(f"⚡ {efficiency:.1f}% token reduction achieved!")
+
+                    if st.session_state.enable_memory and response_metadata.get('memory_used'):
+                        st.info("🧠 Used conversation memory for enhanced context")
+
+                    if st.session_state.enable_agentic_rag and response_metadata.get('agentic_tools_used'):
+                            tools_used = response_metadata['agentic_tools_used']
+                            if tools_used:
+                                st.info(f"🤖 Agentic Tools Used: {', '.join(tools_used)}")
+
+                                # Show additional agentic metadata
+                                agentic_meta = response_metadata.get('agentic_metadata', {})
+                                if agentic_meta.get('entities'):
+                                    with st.expander("🔍 Extracted Entities"):
+                                        for entity_type, entities in agentic_meta['entities'].items():
+                                            if entities:
+                                                st.write(f"**{entity_type}**: {', '.join(entities)}")
+
+                                if agentic_meta.get('avg_relevance'):
+                                    relevance = agentic_meta['avg_relevance']
+                                    st.metric("Average Document Relevance", f"{relevance:.2f}")
+
+                                if response_metadata.get('query_refined'):
+                                    with st.expander("✨ Query Refinement"):
+                                        st.write(f"**Original**: {response_metadata.get('original_query', 'N/A')}")
+                                        st.write(f"**Refined**: {prompt}")
+                            else:
+                                st.info("🤖 Agentic RAG enabled (tools will be used when MCP server is running)")
                 
-                # Generate response with enhanced styling
-                response = generate_response(prompt, relevant_chunks)
-                st.markdown(f"""
-                <div class="response-container">
-                    {response}
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Evaluate response if enabled
-                evaluation_results = None
-                if st.session_state.enable_evaluation:
-                    with st.spinner("Evaluating response..."):
-                        evaluation_results = evaluate_response(prompt, response, relevant_chunks)
-                        if evaluation_results:
-                            threshold = getattr(st.session_state, 'eval_threshold', 0.7)
-                            display_evaluation_results(evaluation_results, threshold)
-                
-                # Show sources with enhanced styling
-                if relevant_chunks:
-                    with st.expander(f"📚 Sources ({len(relevant_chunks)} chunks)"):
-                        for i, chunk in enumerate(relevant_chunks):
+            # Evaluate response if enabled
+            evaluation_results = None
+            if st.session_state.enable_evaluation:
+                with st.spinner("Evaluating response..."):
+                    evaluation_results = evaluate_response(prompt, response, relevant_chunks)
+                    if evaluation_results:
+                        threshold = getattr(st.session_state, 'eval_threshold', 0.7)
+                        display_evaluation_results(evaluation_results, threshold)
+            
+            # Show sources with enhanced styling
+            if relevant_chunks:
+                with st.expander(f"📚 Sources ({len(relevant_chunks)} chunks)"):
+                    for chunk in relevant_chunks:
                             st.markdown(f"""
                             <div class="chunk-display">
                                 <h4>📄 {chunk['filename']} (Score: {chunk['score']:.3f})</h4>
                                 <p>{chunk['text'][:200] + "..." if len(chunk['text']) > 200 else chunk['text']}</p>
                             </div>
                             """, unsafe_allow_html=True)
+                
+            # Feedback Collection Section
+            if st.session_state.feedback_enabled and st.session_state.feedback_system:
+                    with st.expander("📝 Provide Feedback on this Response", expanded=False):
+                        st.write("Help us improve! Share your thoughts on this response.")
+                        
+                        col1, col2 = st.columns([3, 1])
+                        
+                        with col1:
+                            feedback_text = st.text_area(
+                                "Your Feedback",
+                                placeholder="Was this response helpful? Any issues or suggestions?",
+                                key=f"feedback_text_{len(st.session_state.chat_history)}",
+                                height=100
+                            )
+                        
+                        with col2:
+                            rating = st.select_slider(
+                                "Rating",
+                                options=[1, 2, 3, 4, 5],
+                                value=3,
+                                key=f"rating_{len(st.session_state.chat_history)}"
+                            )
+                            st.caption("1=Poor, 5=Excellent")
+                        
+                        user_email = st.text_input(
+                            "Your Email",
+                            placeholder="your.email@example.com",
+                            key=f"user_email_{len(st.session_state.chat_history)}"
+                        )
+                        
+                        if st.button("Submit Feedback", key=f"submit_feedback_{len(st.session_state.chat_history)}"):
+                            if feedback_text.strip():
+                                with st.spinner("Analyzing feedback..."):
+                                    # Collect feedback with sentiment analysis
+                                    feedback_record = st.session_state.feedback_system.collect_feedback(
+                                        query=prompt,
+                                        response=response,
+                                        feedback_text=feedback_text,
+                                        rating=rating,
+                                        user_email=user_email if user_email else None,
+                                        metadata={
+                                            'sources_count': len(relevant_chunks),
+                                            'evaluation': evaluation_results if evaluation_results else None,
+                                            'response_metadata': response_metadata
+                                        }
+                                    )
+                                    
+                                    # Display sentiment analysis
+                                    if feedback_record['sentiment_analysis']['success']:
+                                        sentiment_data = feedback_record['sentiment_analysis']['sentiment_data']
+                                        
+                                        st.success("✅ Thank you for your feedback!")
+                                        
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("Sentiment", sentiment_data.get('sentiment', 'N/A').title())
+                                        with col2:
+                                            st.metric("Satisfaction", f"{sentiment_data.get('satisfaction_score', 'N/A')}/5")
+                                        with col3:
+                                            st.metric("Urgency", sentiment_data.get('urgency', 'N/A').title())
+                                        
+                                        # Send email notification if configured
+                                        smtp_config = st.session_state.get('smtp_config')
+                                        recipient_email = st.session_state.get('feedback_recipient_email')
+                                        
+                                        if smtp_config and recipient_email:
+                                            try:
+                                                with st.spinner("Sending email notification..."):
+                                                    email_result = st.session_state.feedback_system.send_feedback_email(
+                                                        feedback_record,
+                                                        recipient_email,
+                                                        st.session_state.get('feedback_recipient_name', 'Team')
+                                                    )
+                                                
+                                                if email_result.get('success'):
+                                                    st.success(f"📧 Email sent to {recipient_email}")
+                                                else:
+                                                    st.error(f"❌ Email failed: {email_result.get('error', 'Unknown error')}")
+                                            except Exception as e:
+                                                st.error(f"❌ Email error: {str(e)}")
+                                        elif recipient_email and not smtp_config:
+                                            st.warning("⚠️ Configure SMTP settings in sidebar to send emails")
+                                    else:
+                                        st.warning("⚠️ Feedback collected but sentiment analysis failed")
+                            else:
+                                st.warning("Please enter your feedback before submitting")
         
         # Add to chat history
         chat_entry = {
             'query': prompt,
             'response': response,
             'sources': relevant_chunks,
-            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'metadata': response_metadata
         }
-        
+
         if evaluation_results:
             chat_entry['evaluation'] = evaluation_results
-        
+
         st.session_state.chat_history.append(chat_entry)
+
+        # Store token usage stats
+        if response_metadata.get('optimized_tokens', 0) > 0:
+            token_stat = {
+                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                'original_tokens': response_metadata['original_tokens'],
+                'optimized_tokens': response_metadata['optimized_tokens'],
+                'tokens_saved': response_metadata['tokens_saved'],
+                'optimization_applied': response_metadata['optimization_applied']
+            }
+            st.session_state.token_usage_stats.append(token_stat)
         
         # Store evaluation results
         if evaluation_results:
@@ -1467,6 +2372,125 @@ def display_sidebar_info():
     )
     
     st.session_state.top_k = top_k
+    
+    # Feedback System Configuration in Sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.header("📝 Feedback System")
+    
+    feedback_enabled = st.sidebar.checkbox(
+        "Enable Feedback Collection",
+        value=st.session_state.get('feedback_enabled', False),
+        help="Allow users to provide feedback on responses"
+    )
+    st.session_state.feedback_enabled = feedback_enabled
+    
+    if feedback_enabled:
+        # Initialize feedback system if not already done
+        if st.session_state.gemini_client and not st.session_state.feedback_system:
+            api_key = st.session_state.get('api_key')
+            if api_key:
+                smtp_config = st.session_state.get('smtp_config')
+                st.session_state.feedback_system = get_feedback_system(api_key, smtp_config)
+                st.sidebar.success("✅ Feedback system ready")
+        
+        # Email Configuration
+        with st.sidebar.expander("📧 Email Notifications", expanded=False):
+            recipient_email = st.text_input(
+                "Recipient Email",
+                value=st.session_state.get('feedback_recipient_email', ''),
+                placeholder="manager@company.com",
+                help="Email to receive feedback notifications",
+                key="sidebar_recipient_email"
+            )
+            st.session_state.feedback_recipient_email = recipient_email
+            
+            recipient_name = st.text_input(
+                "Recipient Name",
+                value=st.session_state.get('feedback_recipient_name', 'Team'),
+                placeholder="Product Manager",
+                key="sidebar_recipient_name"
+            )
+            st.session_state.feedback_recipient_name = recipient_name
+            
+            st.markdown("**SMTP Configuration:**")
+            
+            smtp_server = st.text_input(
+                "SMTP Server",
+                value=st.session_state.get('smtp_server', 'smtp.gmail.com'),
+                key="sidebar_smtp_server"
+            )
+            
+            smtp_port = st.number_input(
+                "SMTP Port",
+                value=st.session_state.get('smtp_port', 587),
+                min_value=1,
+                max_value=65535,
+                key="sidebar_smtp_port"
+            )
+            
+            smtp_username = st.text_input(
+                "Email Username",
+                value=st.session_state.get('smtp_username', ''),
+                placeholder="your.email@gmail.com",
+                key="sidebar_smtp_username"
+            )
+            
+            smtp_password = st.text_input(
+                "Email Password",
+                type="password",
+                value=st.session_state.get('smtp_password', ''),
+                placeholder="App Password",
+                help="For Gmail, use App Password not regular password",
+                key="sidebar_smtp_password"
+            )
+            
+            use_tls = st.checkbox(
+                "Use TLS",
+                value=st.session_state.get('smtp_use_tls', True),
+                key="sidebar_smtp_tls"
+            )
+            
+            if st.button("💾 Save Email Config", key="save_smtp_sidebar"):
+                if smtp_server and smtp_username and smtp_password and recipient_email:
+                    # Store SMTP config
+                    st.session_state.smtp_config = {
+                        'smtp_server': smtp_server,
+                        'smtp_port': smtp_port,
+                        'username': smtp_username,
+                        'password': smtp_password,
+                        'use_tls': use_tls,
+                        'from_email': smtp_username
+                    }
+                    
+                    # Store individual values for persistence
+                    st.session_state.smtp_server = smtp_server
+                    st.session_state.smtp_port = smtp_port
+                    st.session_state.smtp_username = smtp_username
+                    st.session_state.smtp_password = smtp_password
+                    st.session_state.smtp_use_tls = use_tls
+                    
+                    # Reinitialize feedback system with SMTP config
+                    if st.session_state.get('api_key'):
+                        st.session_state.feedback_system = get_feedback_system(
+                            st.session_state.api_key,
+                            st.session_state.smtp_config
+                        )
+                    
+                    st.sidebar.success("✅ Email config saved!")
+                    st.rerun()
+                else:
+                    st.sidebar.error("❌ Please fill all fields")
+            
+            st.caption("💡 Gmail users: Use App Password from Google Account settings")
+        
+        # Feedback Statistics
+        if st.session_state.feedback_system:
+            stats = st.session_state.feedback_system.get_feedback_statistics()
+            if stats.get('total_feedback', 0) > 0:
+                st.sidebar.markdown("**📊 Statistics:**")
+                st.sidebar.write(f"Total: {stats['total_feedback']}")
+                if stats.get('average_rating'):
+                    st.sidebar.write(f"Avg Rating: {stats['average_rating']:.1f}/5")
     
 
     
@@ -1527,7 +2551,8 @@ def main():
     
     # Setup API and evaluation in sidebar (only for Chat & Evaluation page)
     if st.session_state.current_page == "Chat & Evaluation":
-        api_configured, api_key = setup_gemini_api()
+        api_configured, _ = setup_gemini_api()
+        setup_advanced_features()
         setup_evaluation_settings(api_configured)
         upload_documents()
         display_sidebar_info()

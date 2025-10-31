@@ -10,3 +10,13 @@ pandas>=2.0.0
 plotly>=5.15.0
 tiktoken>=0.5.0
 scikit-learn>=1.3.0
+
+# New dependencies for Agentic RAG, Memory, and Token Optimization
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-core>=0.1.0
+
+# MCP (Model Context Protocol) dependencies for Agentic RAG
+mcp[cli]==1.6.0
+httpx>=0.24.0
+nest_asyncio>=1.5.0
